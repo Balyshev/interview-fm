@@ -3,57 +3,55 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"image"
 	"image/jpeg"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
+	"time"
 
 	jpgresize "github.com/nfnt/resize"
 )
 
-func (s *service) processResizes(request resizeRequest) ([]resizeResult, error) {
+type Job struct {
+	done chan struct{}
+	err  error
+}
+
+func (s *service) processResizes(ctx context.Context, request resizeRequest, async bool) ([]resizeResult, error) {
 	results := make([]resizeResult, 0, len(request.URLs))
+
 	for _, url := range request.URLs {
 		result := resizeResult{}
-		id := genID(url)
-		key := "/v1/image/" + id + ".jpeg"
-		newURL := proto + hostport + key
 
-		if s.cache.Contains(key) {
-			result.URL = newURL
-			result.Result = success
-			result.Cached = true
-			results = append(results, result)
-			continue
-		}
+		key, cached, err := s.ensureImage(
+			ctx,
+			url,
+			request.Width,
+			request.Height,
+			async,
+		)
 
-		data, err := fetchAndResize(url, request.Width, request.Height)
 		if err != nil {
 			log.Printf("failed to resize %s: %v", url, err)
 			result.Result = failure
-			results = append(results, result)
-			continue
+		} else {
+			result.URL = proto + hostport + key
+			result.Result = success
+			result.Cached = cached
 		}
 
-		log.Print("caching ", key)
-		s.cache.Add(key, data)
-
-		result.URL = newURL
-		result.Result = success
-		result.Cached = false
 		results = append(results, result)
 	}
 
 	return results, nil
 }
 
-func fetchAndResize(url string, width uint, height uint) ([]byte, error) {
-	data, err := fetch(url)
+func fetchAndResize(ctx context.Context, url string, width uint, height uint) ([]byte, error) {
+	data, err := fetch(ctx, url)
 	if err != nil {
 		return nil, err
 	}
@@ -61,11 +59,17 @@ func fetchAndResize(url string, width uint, height uint) ([]byte, error) {
 	return resize(data, width, height)
 }
 
-func fetch(url string) ([]byte, error) {
+func fetch(ctx context.Context, url string) ([]byte, error) {
 	log.Print("fetching ", url)
-	r, err := http.Get(url)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("fetch failed: %v", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch failed: %w", err)
 	}
 	defer r.Body.Close()
 
@@ -73,30 +77,31 @@ func fetch(url string) ([]byte, error) {
 		return nil, fmt.Errorf("non-200 status: %d", r.StatusCode)
 	}
 
-	data, err := ioutil.ReadAll(io.LimitReader(r.Body, 15*1024*1024))
+	data, err := io.ReadAll(io.LimitReader(r.Body, 15*1024*1024))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read fetch data: %v", err)
+		return nil, fmt.Errorf("failed to read fetch data: %w", err)
 	}
 
 	return data, nil
 }
 
 func resize(data []byte, width uint, height uint) ([]byte, error) {
-	// decode jpeg into image.Image
 	img, err := jpeg.Decode(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("failed to jped decode: %v", err)
+		return nil, fmt.Errorf("failed to jpeg decode: %v", err)
 	}
 
-	var newImage image.Image
+	newImage := jpgresize.Resize(width, height, img, jpgresize.Lanczos3)
 
-	// if either width or height is 0, it will resize respecting the aspect ratio
-	newImage = jpgresize.Resize(width, height, img, jpgresize.Lanczos3)
+	var newData bytes.Buffer
+	w := bufio.NewWriter(&newData)
 
-	newData := bytes.Buffer{}
-	err = jpeg.Encode(bufio.NewWriter(&newData), newImage, nil)
+	err = jpeg.Encode(w, newImage, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to jpeg encode resized image: %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush buffer: %w", err)
 	}
 
 	return newData.Bytes(), nil
@@ -105,4 +110,69 @@ func resize(data []byte, width uint, height uint) ([]byte, error) {
 func genID(url string) string {
 	hash := sha256.Sum256([]byte(url))
 	return base64.URLEncoding.EncodeToString(hash[:])
+}
+
+func (s *service) ensureImage(
+	ctx context.Context,
+	url string,
+	width uint,
+	height uint,
+	async bool,
+) (string, bool, error) {
+
+	id := genID(url)
+	key := "/v1/image/" + id + ".jpeg"
+
+	// Проверяем кеш
+	if _, ok := s.cache.Get(key); ok {
+		return key, true, nil
+	}
+
+	// Проверяем, не обрабатывается ли уже
+	s.mu.Lock()
+	job, exists := s.processing[key]
+	if !exists {
+		job = &Job{done: make(chan struct{})}
+		s.processing[key] = job
+
+		go func() {
+			defer func() {
+				close(job.done)
+				if r := recover(); r != nil {
+					log.Printf("panic in resize goroutine for %s: %v", url, r)
+				}
+			}()
+
+			// Используем независимый контекст для фоновой обработки
+			bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			data, err := fetchAndResize(bgCtx, url, width, height)
+
+			s.mu.Lock()
+			if err == nil {
+				s.cache.Add(key, data)
+			}
+			job.err = err
+			delete(s.processing, key)
+			s.mu.Unlock()
+		}()
+	}
+	s.mu.Unlock()
+
+	// Для асинхронного режима возвращаем сразу
+	if async {
+		return key, false, nil
+	}
+
+	// Для синхронного режима ждем завершения с таймаутом
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	select {
+	case <-job.done:
+		return key, false, job.err
+	case <-timeoutCtx.Done():
+		return "", false, fmt.Errorf("resize timeout: %w", timeoutCtx.Err())
+	}
 }

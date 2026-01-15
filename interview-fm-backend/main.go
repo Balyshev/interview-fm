@@ -3,12 +3,15 @@ package main
 import (
 	"log"
 	"net/http"
+	"sync"
 
 	lru "github.com/hashicorp/golang-lru"
 )
 
 type service struct {
-	cache *lru.Cache
+	cache      *lru.Cache
+	mu         sync.Mutex
+	processing map[string]*Job
 }
 
 type resizeRequest struct {
@@ -33,11 +36,12 @@ const (
 func main() {
 	cache, err := lru.New(1024)
 	if err != nil {
-		log.Panicf("Faild to create cache: %v", err)
+		log.Panicf("Failed to create cache: %v", err)
 	}
 
 	svc := &service{
-		cache: cache,
+		cache:      cache,
+		processing: make(map[string]*Job),
 	}
 
 	mux := http.NewServeMux()
