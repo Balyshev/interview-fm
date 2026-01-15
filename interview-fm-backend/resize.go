@@ -21,7 +21,12 @@ type Job struct {
 	err  error
 }
 
-func (s *service) processResizes(ctx context.Context, request resizeRequest, async bool) ([]resizeResult, error) {
+func (s *service) processResizes(
+	ctx context.Context,
+	request resizeRequest,
+	async bool,
+) ([]resizeResult, error) {
+
 	results := make([]resizeResult, 0, len(request.URLs))
 
 	for _, url := range request.URLs {
@@ -50,12 +55,11 @@ func (s *service) processResizes(ctx context.Context, request resizeRequest, asy
 	return results, nil
 }
 
-func fetchAndResize(ctx context.Context, url string, width uint, height uint) ([]byte, error) {
+func fetchAndResize(ctx context.Context, url string, width, height uint) ([]byte, error) {
 	data, err := fetch(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-
 	return resize(data, width, height)
 }
 
@@ -64,47 +68,41 @@ func fetch(ctx context.Context, url string) ([]byte, error) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, err
 	}
 
-	r, err := http.DefaultClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch failed: %w", err)
+		return nil, err
 	}
-	defer r.Body.Close()
+	defer resp.Body.Close()
 
-	if r.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("non-200 status: %d", r.StatusCode)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(r.Body, 15*1024*1024))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read fetch data: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("non-200 status: %d", resp.StatusCode)
 	}
 
-	return data, nil
+	return io.ReadAll(io.LimitReader(resp.Body, 15*1024*1024))
 }
 
-func resize(data []byte, width uint, height uint) ([]byte, error) {
+func resize(data []byte, width, height uint) ([]byte, error) {
 	img, err := jpeg.Decode(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("failed to jpeg decode: %v", err)
+		return nil, err
 	}
 
-	newImage := jpgresize.Resize(width, height, img, jpgresize.Lanczos3)
+	resized := jpgresize.Resize(width, height, img, jpgresize.Lanczos3)
 
-	var newData bytes.Buffer
-	w := bufio.NewWriter(&newData)
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
 
-	err = jpeg.Encode(w, newImage, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to jpeg encode resized image: %v", err)
+	if err := jpeg.Encode(w, resized, nil); err != nil {
+		return nil, err
 	}
 	if err := w.Flush(); err != nil {
-		return nil, fmt.Errorf("failed to flush buffer: %w", err)
+		return nil, err
 	}
 
-	return newData.Bytes(), nil
+	return buf.Bytes(), nil
 }
 
 func genID(url string) string {
@@ -115,13 +113,11 @@ func genID(url string) string {
 func (s *service) ensureImage(
 	ctx context.Context,
 	url string,
-	width uint,
-	height uint,
+	width, height uint,
 	async bool,
 ) (string, bool, error) {
 
-	id := genID(url)
-	key := "/v1/image/" + id + ".jpeg"
+	key := "/v1/image/" + genID(url) + ".jpeg"
 
 	if _, ok := s.cache.Get(key); ok {
 		return key, true, nil
@@ -161,13 +157,13 @@ func (s *service) ensureImage(
 		return key, false, nil
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	select {
 	case <-job.done:
 		return key, false, job.err
-	case <-timeoutCtx.Done():
-		return "", false, fmt.Errorf("resize timeout: %w", timeoutCtx.Err())
+	case <-waitCtx.Done():
+		return "", false, fmt.Errorf("resize timeout")
 	}
 }

@@ -20,8 +20,7 @@ func (s *service) resizeHandler() http.HandlerFunc {
 		async := r.URL.Query().Get("async") == "true"
 
 		request := resizeRequest{}
-		err := json.NewDecoder(io.LimitReader(r.Body, 8*1024)).Decode(&request)
-		if err != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8*1024)).Decode(&request); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("Failed to parse request"))
 			return
@@ -51,6 +50,7 @@ func (s *service) getImageHandler() http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.String()
 
+		// Fast path: cache hit
 		if data, ok := s.cache.Get(key); ok {
 			w.Header().Set("content-type", "image/jpeg")
 			w.WriteHeader(http.StatusOK)
@@ -58,11 +58,13 @@ func (s *service) getImageHandler() http.HandlerFunc {
 			return
 		}
 
+		// Check if image is being processed
 		s.mu.Lock()
 		job, exists := s.processing[key]
 		s.mu.Unlock()
 
 		if !exists {
+			// Final cache check to close race window
 			if data, ok := s.cache.Get(key); ok {
 				w.Header().Set("content-type", "image/jpeg")
 				w.WriteHeader(http.StatusOK)
@@ -82,7 +84,6 @@ func (s *service) getImageHandler() http.HandlerFunc {
 		case <-job.done:
 			if job.err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte("Failed to process image"))
 				return
 			}
 
@@ -98,7 +99,6 @@ func (s *service) getImageHandler() http.HandlerFunc {
 
 		case <-ctx.Done():
 			w.WriteHeader(http.StatusGatewayTimeout)
-			w.Write([]byte("Processing timeout"))
 		}
 	})
 }

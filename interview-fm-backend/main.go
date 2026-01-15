@@ -10,8 +10,8 @@ import (
 
 type service struct {
 	cache      *lru.Cache
-	mu         sync.Mutex
 	processing map[string]*Job
+	mu         sync.Mutex
 }
 
 type resizeRequest struct {
@@ -36,7 +36,7 @@ const (
 func main() {
 	cache, err := lru.New(1024)
 	if err != nil {
-		log.Panicf("Failed to create cache: %v", err)
+		log.Panicf("failed to create cache: %v", err)
 	}
 
 	svc := &service{
@@ -47,9 +47,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/resize", svc.resizeHandler())
 	mux.Handle("/v1/image/", svc.getImageHandler())
-	address := hostport
 
 	log.Print("Listening on ", hostport)
-	// When running on docker mac, can't listen only on localhost
-	panic(http.ListenAndServe(address, mux))
+	panic(http.ListenAndServe(hostport, mux))
 }
