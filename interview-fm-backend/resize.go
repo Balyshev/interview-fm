@@ -123,12 +123,10 @@ func (s *service) ensureImage(
 	id := genID(url)
 	key := "/v1/image/" + id + ".jpeg"
 
-	// Проверяем кеш
 	if _, ok := s.cache.Get(key); ok {
 		return key, true, nil
 	}
 
-	// Проверяем, не обрабатывается ли уже
 	s.mu.Lock()
 	job, exists := s.processing[key]
 	if !exists {
@@ -143,7 +141,6 @@ func (s *service) ensureImage(
 				}
 			}()
 
-			// Используем независимый контекст для фоновой обработки
 			bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
@@ -160,12 +157,10 @@ func (s *service) ensureImage(
 	}
 	s.mu.Unlock()
 
-	// Для асинхронного режима возвращаем сразу
 	if async {
 		return key, false, nil
 	}
 
-	// Для синхронного режима ждем завершения с таймаутом
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 

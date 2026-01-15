@@ -51,7 +51,6 @@ func (s *service) getImageHandler() http.HandlerFunc {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.String()
 
-		// 1. Cache hit — самый быстрый путь
 		if data, ok := s.cache.Get(key); ok {
 			w.Header().Set("content-type", "image/jpeg")
 			w.WriteHeader(http.StatusOK)
@@ -59,13 +58,11 @@ func (s *service) getImageHandler() http.HandlerFunc {
 			return
 		}
 
-		// 2. Проверяем, обрабатывается ли изображение
 		s.mu.Lock()
 		job, exists := s.processing[key]
 		s.mu.Unlock()
 
 		if !exists {
-			// Финальная проверка кеша (закрывает race между шагами 1 и 2)
 			if data, ok := s.cache.Get(key); ok {
 				w.Header().Set("content-type", "image/jpeg")
 				w.WriteHeader(http.StatusOK)
@@ -78,7 +75,6 @@ func (s *service) getImageHandler() http.HandlerFunc {
 
 		log.Printf("waiting for image %s", key)
 
-		// 3. Ждём завершения обработки с таймаутом
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 
@@ -90,7 +86,6 @@ func (s *service) getImageHandler() http.HandlerFunc {
 				return
 			}
 
-			// Повторно проверяем кеш
 			data, ok := s.cache.Get(key)
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
